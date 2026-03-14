@@ -5,95 +5,157 @@ from aws_lambda_powertools import Logger
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.chat_message_histories import DynamoDBChatMessageHistory
-from langchain_community.vectorstores import FAISS
 from langchain_aws.chat_models import ChatBedrock
 from langchain_aws.embeddings import BedrockEmbeddings
-
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from pydantic import Field
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+from typing import List
 
 MEMORY_TABLE = os.environ["MEMORY_TABLE"]
-BUCKET = os.environ["BUCKET"]
 MODEL_ID = os.environ["MODEL_ID"]
 EMBEDDING_MODEL_ID = os.environ["EMBEDDING_MODEL_ID"]
+OPENSEARCH_ENDPOINT = os.environ["OPENSEARCH_ENDPOINT"]
+OPENSEARCH_INDEX = os.environ["OPENSEARCH_INDEX"]
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
-s3 = boto3.client("s3")
+K = 5
+
 logger = Logger()
+
+
+def get_opensearch_client():
+    host = OPENSEARCH_ENDPOINT.replace("https://", "").replace("http://", "").rstrip("/")
+    credentials = boto3.Session().get_credentials()
+    awsauth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        AWS_REGION,
+        "aoss",
+        session_token=credentials.token,
+    )
+    return OpenSearch(
+        hosts=[{"host": host, "port": 443}],
+        http_auth=awsauth,
+        use_ssl=True,
+        verify_certs=True,
+        connection_class=RequestsHttpConnection,
+    )
+
+
+class OpenSearchRetriever(BaseRetriever):
+    client: OpenSearch = Field(exclude=True)
+    index_name: str
+    embeddings: BedrockEmbeddings
+    user_id: str
+    document_id: str
+    k: int = K
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
+    ) -> List[Document]:
+        query_vector = self.embeddings.embed_query(query)
+        body = {
+            "size": self.k,
+            "query": {
+                "bool": {
+                    "must": [
+                        {"knn": {"embedding": {"vector": query_vector, "k": self.k}}}
+                    ],
+                    "filter": {
+                        "bool": {
+                            "must": [
+                                {"term": {"user_id": self.user_id}},
+                                {"term": {"document_id": self.document_id}},
+                            ]
+                        }
+                    },
+                }
+            },
+        }
+        response = self.client.search(index=self.index_name, body=body)
+        docs = []
+        for hit in response.get("hits", {}).get("hits", []):
+            source = hit.get("_source", {})
+            docs.append(
+                Document(
+                    page_content=source.get("text", ""),
+                    metadata={"page": source.get("page", 0), "chunk_index": source.get("chunk_index", 0)},
+                )
+            )
+        return docs
 
 
 def get_embeddings():
     bedrock_runtime = boto3.client(
         service_name="bedrock-runtime",
-        region_name="us-east-1",
+        region_name=AWS_REGION,
     )
-
-    embeddings = BedrockEmbeddings(
+    return BedrockEmbeddings(
         model_id=EMBEDDING_MODEL_ID,
         client=bedrock_runtime,
-        region_name="us-east-1",
+        region_name=AWS_REGION,
     )
-    return embeddings
 
-def get_faiss_index(embeddings, user, file_name):
-    s3.download_file(BUCKET, f"{user}/{file_name}/index.faiss", "/tmp/index.faiss")
-    s3.download_file(BUCKET, f"{user}/{file_name}/index.pkl", "/tmp/index.pkl")
-    faiss_index = FAISS.load_local("/tmp", embeddings, allow_dangerous_deserialization=True)
-    return faiss_index
 
 def create_memory(user_id, conversation_id):
     message_history = DynamoDBChatMessageHistory(
-        table_name=MEMORY_TABLE, session_id=conversation_id, key={"userid": user_id, "SessionId":conversation_id}
+        table_name=MEMORY_TABLE,
+        session_id=conversation_id,
+        key={"userid": user_id, "SessionId": conversation_id},
     )
-
-    memory = ConversationBufferMemory(
+    return ConversationBufferMemory(
         memory_key="chat_history",
         chat_memory=message_history,
         input_key="question",
         output_key="answer",
         return_messages=True,
     )
-    return memory
 
-def bedrock_chain(faiss_index, memory, human_input, bedrock_runtime):
 
-    chat = ChatBedrock(
-        model_id=MODEL_ID,
-        model_kwargs={'temperature': 0.0}
-    )
-
+def bedrock_chain(retriever, memory, human_input):
+    chat = ChatBedrock(model_id=MODEL_ID, model_kwargs={"temperature": 0.0})
     chain = ConversationalRetrievalChain.from_llm(
         llm=chat,
         chain_type="stuff",
-        retriever=faiss_index.as_retriever(),
+        retriever=retriever,
         memory=memory,
         return_source_documents=True,
     )
+    return chain.invoke({"question": human_input})
 
-    response = chain.invoke({"question": human_input})
-
-    return response
 
 @logger.inject_lambda_context(log_event=True)
 def lambda_handler(event, context):
     event_body = json.loads(event["body"])
-    file_name = event_body["fileName"]
     human_input = event_body["prompt"]
     conversation_id = event["pathParameters"]["conversationid"]
+    document_id = event["pathParameters"]["documentid"]
     user = event["requestContext"]["authorizer"]["claims"]["sub"]
 
     embeddings = get_embeddings()
-    faiss_index = get_faiss_index(embeddings, user, file_name)
-    memory = create_memory(user, conversation_id)
-    bedrock_runtime = boto3.client(
-        service_name="bedrock-runtime",
-        region_name="us-east-1",
+    client = get_opensearch_client()
+    retriever = OpenSearchRetriever(
+        client=client,
+        index_name=OPENSEARCH_INDEX,
+        embeddings=embeddings,
+        user_id=user,
+        document_id=document_id,
+        k=K,
     )
+    memory = create_memory(user, conversation_id)
 
-    response = bedrock_chain(faiss_index, memory, human_input, bedrock_runtime)
-    if response:
-        print(f"{MODEL_ID} -\nPrompt: {human_input}\n\nResponse: {response['answer']}")
-    else:
+    response = bedrock_chain(retriever, memory, human_input)
+    if not response:
         raise ValueError(f"Unsupported model ID: {MODEL_ID}")
 
-    logger.info(str(response['answer']))
+    logger.info(str(response["answer"]))
 
     return {
         "statusCode": 200,
@@ -103,5 +165,5 @@ def lambda_handler(event, context):
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "*",
         },
-        "body": json.dumps(response['answer']),
+        "body": json.dumps(response["answer"]),
     }
