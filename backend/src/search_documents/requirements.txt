@@ -1,4 +1,5 @@
 boto3
 botocore
+langchain-aws==0.2.17
 opensearch-py>=2.4.0
 requests-aws4auth>=1.2.0
