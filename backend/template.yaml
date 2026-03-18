@@ -88,16 +88,6 @@ Resources:
     Properties:
       VisibilityTimeout: 180
       MessageRetentionPeriod: 3600
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt EmbeddingDLQ.Arn
-        maxReceiveCount: 3
-
-  EmbeddingDLQ:
-    Type: AWS::SQS::Queue
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Delete
-    Properties:
-      MessageRetentionPeriod: 1209600
 
   EmbeddingQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -150,35 +140,6 @@ Resources:
         - AttributeName: SessionId
           AttributeType: S
       BillingMode: PAY_PER_REQUEST
-
-  # OpenSearch Serverless for vector store
-  VectorCollectionEncryptionPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${AWS::StackName}-vector-encryption"
-      Type: encryption
-      Policy: '{"Rules":[{"ResourceType":"collection","Resource":["collection/pdfchat"]}],"AWSOwnedKey":true}'
-
-  VectorCollectionNetworkPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${AWS::StackName}-vector-network"
-      Type: network
-      Policy: '[{"Rules":[{"ResourceType":"collection","Resource":["collection/pdfchat"]},{"ResourceType":"dashboard","Resource":["collection/pdfchat"]}],"AllowFromPublic":true}]'
-
-  VectorCollection:
-    Type: AWS::OpenSearchServerless::Collection
-    DependsOn: VectorCollectionEncryptionPolicy
-    Properties:
-      Name: pdfchat
-      Type: VECTORSEARCH
-      Description: Vector store for PDF document embeddings
-
-  DocumentReadyTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "${AWS::StackName}-document-ready"
-      DisplayName: Document processing complete
 
   CognitoUserPool:
     Type: AWS::Cognito::UserPool
@@ -341,7 +302,7 @@ Resources:
       Policies:
         - SQSPollerPolicy:
             QueueName: !GetAtt EmbeddingQueue.QueueName
-        - S3ReadPolicy:
+        - S3CrudPolicy:
             BucketName: !Ref DocumentBucket
         - DynamoDBCrudPolicy:
             TableName: !Ref DocumentTable
@@ -350,23 +311,11 @@ Resources:
               Effect: "Allow"
               Action: "bedrock:InvokeModel"
               Resource: !Sub "arn:aws:bedrock:*::foundation-model/${EmbeddingModelId}"
-            - Sid: "OpenSearchServerless"
-              Effect: "Allow"
-              Action: "aoss:APIAccessAll"
-              Resource: !GetAtt VectorCollection.Arn
-            - Sid: "SNSPublishDocumentReady"
-              Effect: "Allow"
-              Action: "sns:Publish"
-              Resource: !Ref DocumentReadyTopic
       Environment:
         Variables:
           DOCUMENT_TABLE: !Ref DocumentTable
           BUCKET: !Ref DocumentBucket
           EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
-          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
-          OPENSEARCH_INDEX: pdfchat
-          DOCUMENT_READY_TOPIC_ARN: !Ref DocumentReadyTopic
-          AWS_REGION: !Ref AWS::Region
       Events:
         EmbeddingQueueEvent:
           Type: SQS
@@ -383,6 +332,8 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref MemoryTable
+        - S3CrudPolicy:
+            BucketName: !Ref DocumentBucket
         - Statement:
             - Sid: "BedrockScopedAccess"
               Effect: "Allow"
@@ -390,18 +341,12 @@ Resources:
               Resource:
                 - !Sub "arn:aws:bedrock:*::foundation-model/${ModelId}"
                 - !Sub "arn:aws:bedrock:*::foundation-model/${EmbeddingModelId}"
-            - Sid: "OpenSearchServerless"
-              Effect: "Allow"
-              Action: "aoss:APIAccessAll"
-              Resource: !GetAtt VectorCollection.Arn
       Environment:
         Variables:
           MEMORY_TABLE: !Ref MemoryTable
+          BUCKET: !Ref DocumentBucket
           MODEL_ID: !Ref ModelId
           EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
-          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
-          OPENSEARCH_INDEX: pdfchat
-          AWS_REGION: !Ref AWS::Region
       Events:
         Root:
           Type: Api
@@ -420,20 +365,12 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref MemoryTable
         - S3CrudPolicy:
-            BucketName: !Ref DocumentBucket
-        - Statement:
-            - Sid: "OpenSearchServerless"
-              Effect: "Allow"
-              Action: "aoss:APIAccessAll"
-              Resource: !GetAtt VectorCollection.Arn
+            BucketName: !Sub "${AWS::StackName}-${AWS::Region}-${AWS::AccountId}*"
       Environment:
         Variables:
           DOCUMENT_TABLE: !Ref DocumentTable
           MEMORY_TABLE: !Ref MemoryTable
-          BUCKET: !Ref DocumentBucket
-          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
-          OPENSEARCH_INDEX: pdfchat
-          AWS_REGION: !Ref AWS::Region
+          BUCKET: !Sub "${AWS::StackName}-${AWS::Region}-${AWS::AccountId}"
       Events:
         Root:
           Type: Api
@@ -441,76 +378,6 @@ Resources:
             RestApiId: !Ref Api
             Path: /doc/{documentid}
             Method: DELETE
-
-  SearchDocumentsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/search_documents/
-      Timeout: 30
-      MemorySize: 512
-      Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref DocumentTable
-        - Statement:
-            - Sid: "OpenSearchServerless"
-              Effect: "Allow"
-              Action: "aoss:APIAccessAll"
-              Resource: !GetAtt VectorCollection.Arn
-            - Sid: "BedrockScopedAccess"
-              Effect: "Allow"
-              Action: "bedrock:InvokeModel"
-              Resource: !Sub "arn:aws:bedrock:*::foundation-model/${EmbeddingModelId}"
-      Environment:
-        Variables:
-          DOCUMENT_TABLE: !Ref DocumentTable
-          OPENSEARCH_ENDPOINT: !GetAtt VectorCollection.CollectionEndpoint
-          OPENSEARCH_INDEX: pdfchat
-          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
-          AWS_REGION: !Ref AWS::Region
-      Events:
-        Root:
-          Type: Api
-          Properties:
-            RestApiId: !Ref Api
-            Path: /search
-            Method: GET
-
-  EmbeddingDLQHandlerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/embedding_dlq_handler/
-      Timeout: 60
-      Policies:
-        - SQSPollerPolicy:
-            QueueName: !GetAtt EmbeddingDLQ.QueueName
-        - Statement:
-            - Sid: "SNSPublishAlerts"
-              Effect: "Allow"
-              Action: "sns:Publish"
-              Resource: !Ref DocumentReadyTopic
-      Environment:
-        Variables:
-          DOCUMENT_READY_TOPIC_ARN: !Ref DocumentReadyTopic
-          AWS_REGION: !Ref AWS::Region
-      Events:
-        DLQEvent:
-          Type: SQS
-          Properties:
-            Queue: !GetAtt EmbeddingDLQ.Arn
-            BatchSize: 10
-
-  VectorCollectionAccessPolicy:
-    Type: AWS::OpenSearchServerless::AccessPolicy
-    DependsOn: [VectorCollection, GenerateEmbeddingsFunction, GenerateResponseFunction, DeleteDocumentFunction, SearchDocumentsFunction]
-    Properties:
-      Name: !Sub "${AWS::StackName}-vector-access"
-      Type: data
-      Policy: !Sub
-        - '[{"Description":"Lambda access to vector collection","Rules":[{"ResourceType":"index","Resource":["index/pdfchat/*"],"Permission":["aoss:*"]},{"ResourceType":"collection","Resource":["collection/pdfchat"],"Permission":["aoss:*"]}],"Principal":["${GenEmbRole}","${GenResRole}","${DelDocRole}","${SearchRole}"]}]'
-        - GenEmbRole: !Ref GenerateEmbeddingsFunctionRole
-          GenResRole: !Ref GenerateResponseFunctionRole
-          DelDocRole: !Ref DeleteDocumentFunctionRole
-          SearchRole: !Ref SearchDocumentsFunctionRole
 
   AmplifyApp:
     Type: AWS::Amplify::App
@@ -566,7 +433,3 @@ Outputs:
     Value: !Ref CognitoUserPoolClient
   ApiGatewayBaseUrl:
     Value: !Sub "https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/dev/"
-  DocumentReadyTopicArn:
-    Value: !Ref DocumentReadyTopic
-  VectorCollectionEndpoint:
-    Value: !GetAtt VectorCollection.CollectionEndpoint
